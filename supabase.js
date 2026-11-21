@@ -5,8 +5,8 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
 export const sb = createClient(
-  'YOUR_SUPABASE_URL',
-  'YOUR_SUPABASE_ANON_KEY',
+  'https://prnyaegqyqenganlmxih.supabase.co',
+  'sb_publishable_gX7yR83JPQRs7ym49h2RRw_6gI9O8JS',
   { auth: { persistSession: true, autoRefreshToken: true } }
 );
 
