@@ -1,11 +1,11 @@
 /* ============================================================
-   app.js — messenger UI
+   app.js — full messenger with calls, voice, announcements
    ============================================================ */
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
 import htm from 'htm';
-import { auth, conversations, messages, subscribeMessages, users } from './supabase.js';
+import { auth, conversations, messages, subscribeMessages, users, sb } from './supabase.js';
 import { CallManager } from './calls.js';
 
 const html = htm.bind(React.createElement);
@@ -23,6 +23,7 @@ function App() {
   const { theme, toggle } = useTheme();
   const [user, setUser] = useState(null);
   const [boot, setBoot] = useState(true);
+  const [incomingCall, setIncomingCall] = useState(null);
 
   useEffect(() => {
     (async () => {
@@ -30,6 +31,27 @@ function App() {
       finally { setBoot(false); }
     })();
   }, []);
+
+  // Global listener for incoming calls via Realtime
+  useEffect(() => {
+    if (!user) return;
+    const ch = sb.channel('calls-global')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'call_rings' }, (payload) => {
+        const r = payload.new;
+        if (r.callee_id === user.id && r.status === 'ringing') {
+          setIncomingCall(r);
+        }
+      })
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'call_rings' }, (payload) => {
+        const r = payload.new;
+        if (r.caller_id === user.id && r.status === 'declined') {
+          setIncomingCall(null);
+          alert('Call declined');
+        }
+      })
+      .subscribe();
+    return () => { sb.removeChannel(ch); };
+  }, [user]);
 
   if (boot) return html`<div className="min-h-screen flex items-center justify-center">Loading…</div>`;
 
@@ -43,8 +65,9 @@ function App() {
         </div>
       </header>
       <main className="flex-1">
-        ${!user ? html`<${AuthScreen} onAuth=${setUser} />` : html`<${MessengerScreen} user=${user} />`}
+        ${!user ? html`<${AuthScreen} onAuth=${setUser} />` : html`<${MessengerScreen} user=${user} incomingCall=${incomingCall} setIncomingCall=${setIncomingCall} />`}
       </main>
+      ${incomingCall && html`<${IncomingCallModal} call=${incomingCall} user=${user} onClose=${() => setIncomingCall(null)} />`}
     </div>
   `;
 }
@@ -87,16 +110,12 @@ function AuthScreen({ onAuth }) {
   `;
 }
 
-function MessengerScreen({ user }) {
+function MessengerScreen({ user, incomingCall, setIncomingCall }) {
   const [convs, setConvs] = useState([]);
   const [active, setActive] = useState(null);
   const [showNew, setShowNew] = useState(false);
 
-  const load = useCallback(async () => {
-    const list = await conversations.listMine();
-    setConvs(list);
-  }, []);
-
+  const load = useCallback(async () => { setConvs(await conversations.listMine()); }, []);
   useEffect(() => { load(); }, [load]);
 
   return html`
@@ -107,15 +126,16 @@ function MessengerScreen({ user }) {
           <button onClick=${() => setShowNew(true)} className="px-2 py-1 text-sm rounded bg-indigo-600 text-white">+ New</button>
         </div>
         <div className="flex-1 overflow-y-auto">
-          ${convs.length === 0
-            ? html`<p className="p-4 text-sm text-slate-500">No conversations yet.</p>`
-            : convs.map((c) => html`
-                <button key=${c.id} onClick=${() => setActive(c)}
-                  className=${`w-full text-left px-3 py-2 border-b border-slate-100 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800 ${active?.id === c.id ? 'bg-slate-100 dark:bg-slate-800' : ''}`}>
-                  <div className="font-medium text-sm">${c.name || 'DM'}</div>
-                  <div className="text-xs text-slate-500">${c.memberCount} members</div>
-                </button>
-              `)}
+          ${convs.map((c) => html`
+            <button key=${c.id} onClick=${() => setActive(c)}
+              className=${`w-full text-left px-3 py-2 border-b border-slate-100 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800 ${active?.id === c.id ? 'bg-slate-100 dark:bg-slate-800' : ''}`}>
+              <div className="font-medium text-sm flex items-center gap-2">
+                ${c.name || 'DM'}
+                ${c.is_announcement && html`<span className="text-[10px] bg-amber-100 text-amber-700 px-1 rounded">📢</span>`}
+              </div>
+              <div className="text-xs text-slate-500">${c.memberCount} members</div>
+            </button>
+          `)}
         </div>
       </aside>
       <section className="md:col-span-2 flex flex-col">
@@ -132,18 +152,28 @@ function ChatRoom({ user, conversation, onLeft }) {
   const [msgs, setMsgs] = useState([]);
   const [text, setText] = useState('');
   const [inCall, setInCall] = useState(false);
+  const [callType, setCallType] = useState(null); // 'audio' | 'video'
+  const [recording, setRecording] = useState(false);
+  const [members, setMembers] = useState([]);
+  const [showMembers, setShowMembers] = useState(false);
+  const mediaRecorderRef = useRef(null);
+  const chunksRef = useRef([]);
   const bottomRef = useRef(null);
 
-  const load = useCallback(async () => { setMsgs(await messages.list(conversation.id)); }, [conversation.id]);
+  const load = useCallback(async () => {
+    setMsgs(await messages.list(conversation.id));
+    setMembers(await conversations.getMembers(conversation.id));
+  }, [conversation.id]);
 
   useEffect(() => { load(); }, [load]);
-
   useEffect(() => {
     const unsub = subscribeMessages(conversation.id, (m) => setMsgs((prev) => prev.some((x) => x.id === m.id) ? prev : [...prev, m]));
     return unsub;
   }, [conversation.id]);
-
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [msgs]);
+
+  const isAnnouncement = conversation.is_announcement && conversation.owner_id !== user.id;
+  const canAddMembers = !conversation.is_announcement; // only owner can remove; anyone can add to non-announcement
 
   const send = async (e) => {
     e.preventDefault();
@@ -158,27 +188,73 @@ function ChatRoom({ user, conversation, onLeft }) {
     setMsgs((prev) => prev.some((x) => x.id === m.id) ? prev : [...prev, m]);
   };
 
-  if (inCall) return html`<${CallRoom} user=${user} conversation=${conversation} onLeave=${() => setInCall(false)} />`;
+  const startRecording = async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const mr = new MediaRecorder(stream);
+    mediaRecorderRef.current = mr;
+    chunksRef.current = [];
+    mr.ondataavailable = (e) => chunksRef.current.push(e.data);
+    mr.onstop = async () => {
+      const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
+      const file = new File([blob], `voice-${Date.now()}.webm`, { type: 'audio/webm' });
+      await sendFile({ name: file.name, type: 'audio', rawFile: file });
+      stream.getTracks().forEach(t => t.stop());
+    };
+    mr.start();
+    setRecording(true);
+  };
+
+  const stopRecording = () => {
+    mediaRecorderRef.current?.stop();
+    setRecording(false);
+  };
+
+  const startCall = async (type) => {
+    // Insert a ringing row
+    const { data, error } = await sb.from('call_rings').insert({
+      conversation_id: conversation.id,
+      caller_id: user.id,
+      callee_id: members.find(m => m.userId !== user.id)?.userId,
+      status: 'ringing',
+    }).select().single();
+    if (error) { alert('Call failed: ' + error.message); return; }
+    setCallType(type);
+    setInCall(true);
+  };
+
+  if (inCall && callType) return html`<${CallRoom} user=${user} conversation=${conversation} members=${members} callType=${callType} onLeave=${() => { setInCall(false); setCallType(null); }} />`;
 
   return html`
     <div className="flex flex-col h-full">
       <header className="p-3 border-b border-slate-200 dark:border-slate-800 flex justify-between items-center">
-        <span className="font-semibold">${conversation.name || 'DM'}</span>
+        <span className="font-semibold flex items-center gap-2">
+          ${conversation.name || 'DM'}
+          ${conversation.is_announcement && html`<span className="text-xs bg-amber-100 text-amber-700 px-1 rounded">Announcement</span>`}
+        </span>
         <div className="flex gap-1">
-          <button onClick=${() => setInCall(true)} className="px-2 py-1 text-sm rounded hover:bg-slate-100 dark:hover:bg-slate-800" title="Audio call">📞</button>
-          <button onClick=${() => setInCall(true)} className="px-2 py-1 text-sm rounded hover:bg-slate-100 dark:hover:bg-slate-800" title="Video call">🎥</button>
-          <button onClick=${async () => { if (!confirm('Leave this chat?')) return; await conversations.leave(conversation.id); onLeft(); }} className="px-2 py-1 text-sm rounded hover:bg-slate-100 dark:hover:bg-slate-800">Leave</button>
+          <button onClick=${() => startCall('audio')} className="px-2 py-1 text-sm rounded hover:bg-slate-100 dark:hover:bg-slate-800">📞</button>
+          <button onClick=${() => startCall('video')} className="px-2 py-1 text-sm rounded hover:bg-slate-100 dark:hover:bg-slate-800">🎥</button>
+          <button onClick=${() => setShowMembers(true)} className="px-2 py-1 text-sm rounded hover:bg-slate-100 dark:hover:bg-slate-800">👥</button>
+          <button onClick=${async () => { if (!confirm('Leave?')) return; await conversations.leave(conversation.id); onLeft(); }} className="px-2 py-1 text-sm rounded hover:bg-slate-100 dark:hover:bg-slate-800">Leave</button>
         </div>
       </header>
       <div className="flex-1 overflow-y-auto p-3 flex flex-col gap-2">
         ${msgs.map((m) => html`<${MessageBubble} key=${m.id} m=${m} mine=${m.authorId === user.id} />`)}
         <div ref=${bottomRef}></div>
       </div>
-      <form onSubmit=${send} className="p-3 border-t border-slate-200 dark:border-slate-800 flex gap-2">
-        <${FileButton} onPick=${sendFile} />
-        <input className="flex-1 px-3 py-2 border rounded dark:bg-slate-800 dark:border-slate-700" value=${text} onChange=${(e) => setText(e.target.value)} placeholder="Message…" />
-        <button className="px-4 py-2 bg-indigo-600 text-white rounded disabled:opacity-50" disabled=${!text.trim()}>Send</button>
-      </form>
+      ${!isAnnouncement && html`
+        <form onSubmit=${send} className="p-3 border-t border-slate-200 dark:border-slate-800 flex gap-2">
+          <${FileButton} onPick=${sendFile} />
+          <button type="button" onClick=${recording ? stopRecording : startRecording}
+            className=${`px-2 py-1 rounded ${recording ? 'bg-red-600 text-white animate-pulse' : 'hover:bg-slate-100 dark:hover:bg-slate-800'}`}>
+            ${recording ? '⏹' : '🎤'}
+          </button>
+          <input className="flex-1 px-3 py-2 border rounded dark:bg-slate-800 dark:border-slate-700" value=${text} onChange=${(e) => setText(e.target.value)} placeholder="Message…" />
+          <button className="px-4 py-2 bg-indigo-600 text-white rounded disabled:opacity-50" disabled=${!text.trim()}>Send</button>
+        </form>
+      `}
+      ${isAnnouncement && html`<div className="p-3 border-t border-slate-200 dark:border-slate-800 text-sm text-slate-500 text-center">Only the owner can post in this announcement group.</div>`}
+      ${showMembers && html`<${MembersModal} conversation=${conversation} members=${members} user=${user} onClose=${() => setShowMembers(false)} onRefresh=${load} />`}
     </div>
   `;
 }
@@ -220,32 +296,38 @@ function FileButton({ onPick }) {
   `;
 }
 
-function CallRoom({ user, conversation, onLeave }) {
+function CallRoom({ user, conversation, members, callType, onLeave }) {
   const [caller, setCaller] = useState(null);
   const [peers, setPeers] = useState({});
+  const [status, setStatus] = useState('connecting');
   const localVideo = useRef(null);
   const remoteVideos = useRef({});
 
   useEffect(() => {
+    const remoteUser = members.find(m => m.userId !== user.id);
+    if (!remoteUser) { onLeave(); return; }
+
     const mgr = new CallManager({
       roomId: `conv-${conversation.id}`,
       userId: user.id,
-      displayName: user.displayName,
+      peerId: remoteUser.userId,
       onPeerStream: (peerId, stream) => {
         setPeers((prev) => ({ ...prev, [peerId]: stream }));
+        setStatus('connected');
       },
       onPeerLeave: (peerId) => {
         setPeers((prev) => { const n = { ...prev }; delete n[peerId]; return n; });
+        setStatus('ended');
       },
-      onError: (e) => console.error('[Call]', e),
+      onError: (e) => { console.error('[Call]', e); setStatus('error'); },
     });
     setCaller(mgr);
     (async () => {
-      const stream = await mgr.start({ audio: true, video: true });
+      const stream = await mgr.start({ audio: true, video: callType === 'video' });
       if (stream && localVideo.current) localVideo.current.srcObject = stream;
     })();
     return () => { mgr.hangup(); };
-  }, [conversation.id, user.id]);
+  }, [conversation.id, user.id, callType]);
 
   useEffect(() => {
     Object.entries(peers).forEach(([pid, stream]) => {
@@ -257,10 +339,10 @@ function CallRoom({ user, conversation, onLeave }) {
   return html`
     <div className="flex flex-col h-full bg-slate-900 text-white">
       <header className="p-3 flex justify-between">
-        <span>Call — ${conversation.name || 'DM'}</span>
+        <span>Call — ${conversation.name || 'DM'} (${status})</span>
         <div className="flex gap-2">
           <button onClick=${() => caller?.toggleAudio()} className="px-2 py-1 rounded bg-white/10 hover:bg-white/20">🎤</button>
-          <button onClick=${() => caller?.toggleVideo()} className="px-2 py-1 rounded bg-white/10 hover:bg-white/20">🎥</button>
+          ${callType === 'video' && html`<button onClick=${() => caller?.toggleVideo()} className="px-2 py-1 rounded bg-white/10 hover:bg-white/20">🎥</button>`}
           <button onClick=${() => caller?.shareScreen()} className="px-2 py-1 rounded bg-white/10 hover:bg-white/20">🖥</button>
           <button onClick=${async () => { await caller?.hangup(); onLeave(); }} className="px-2 py-1 rounded bg-red-600 hover:bg-red-700">Hangup</button>
         </div>
@@ -270,7 +352,80 @@ function CallRoom({ user, conversation, onLeave }) {
         ${Object.entries(peers).map(([pid, stream]) => html`
           <video key=${pid} ref=${(el) => { if (el) { remoteVideos.current[pid] = el; el.srcObject = stream; } }} autoPlay playsInline className="w-full h-full object-cover rounded bg-black" />
         `)}
-        ${Object.keys(peers).length === 0 && html`<div className="flex items-center justify-center text-slate-400 text-sm">Waiting for others to join…</div>`}
+        ${Object.keys(peers).length === 0 && html`<div className="flex items-center justify-center text-slate-400 text-sm">Connecting…</div>`}
+      </div>
+    </div>
+  `;
+}
+
+function IncomingCallModal({ call, user, onClose }) {
+  const accept = async () => {
+    const { error } = await sb.from('call_rings').update({ status: 'accepted' }).eq('id', call.id);
+    if (error) { alert(error.message); return; }
+    // The caller's ChatRoom will see the update and join; to keep simple, we just alert
+    alert('Accepted. Open the chat to join the call.');
+    onClose();
+  };
+  const decline = async () => {
+    await sb.from('call_rings').update({ status: 'declined' }).eq('id', call.id);
+    onClose();
+  };
+  return html`
+    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
+      <div className="bg-white dark:bg-slate-900 rounded-xl p-6 max-w-sm w-full">
+        <h3 className="text-lg font-bold mb-2">Incoming call</h3>
+        <p className="text-sm text-slate-500 mb-4">From user ${call.caller_id}</p>
+        <div className="flex gap-2">
+          <button onClick=${accept} className="flex-1 px-4 py-2 bg-green-600 text-white rounded">Accept</button>
+          <button onClick=${decline} className="flex-1 px-4 py-2 bg-red-600 text-white rounded">Decline</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function MembersModal({ conversation, members, user, onClose, onRefresh }) {
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState([]);
+
+  const search = async (q) => {
+    setQuery(q);
+    if (q.length < 2) { setResults([]); return; }
+    const r = await users.search(q);
+    setResults(r.filter((u) => !members.some((m) => m.userId === u.id)));
+  };
+
+  const add = async (u) => {
+    await conversations.addMembers(conversation.id, [u.id]);
+    setQuery(''); setResults([]);
+    await onRefresh();
+  };
+
+  const remove = async (m) => {
+    const { error } = await sb.from('conversation_members').delete().eq('id', m.id);
+    if (error) { alert(error.message); return; }
+    await onRefresh();
+  };
+
+  const isOwner = conversation.owner_id === user.id;
+
+  return html`
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-50" onClick=${(e) => e.target === e.currentTarget && onClose()}>
+      <div className="bg-white dark:bg-slate-900 rounded-xl max-w-md w-full p-4 flex flex-col gap-3">
+        <h2 className="text-lg font-bold">Members</h2>
+        <div className="max-h-48 overflow-y-auto flex flex-col gap-1">
+          ${members.map((m) => html`
+            <div key=${m.id} className="flex justify-between items-center px-2 py-1 rounded hover:bg-slate-100 dark:hover:bg-slate-800">
+              <span className="text-sm">${m.displayName}</span>
+              ${isOwner && m.userId !== user.id && html`<button onClick=${() => remove(m)} className="text-xs text-red-500">Remove</button>`}
+            </div>
+          `)}
+        </div>
+        <input className="px-3 py-2 border rounded dark:bg-slate-800 dark:border-slate-700" placeholder="Search users to add…" value=${query} onChange=${(e) => search(e.target.value)} />
+        ${results.length > 0 && html`<div className="max-h-32 overflow-y-auto flex flex-col gap-1">
+          ${results.map((r) => html`<button key=${r.id} onClick=${() => add(r)} className="text-left px-2 py-1 rounded hover:bg-slate-100 dark:hover:bg-slate-800">${r.displayName}</button>`)}
+        </div>`}
+        <div className="flex justify-end"><button onClick=${onClose} className="px-3 py-1 rounded hover:bg-slate-100 dark:hover:bg-slate-800">Close</button></div>
       </div>
     </div>
   `;
@@ -281,6 +436,7 @@ function NewConversationModal({ user, onClose, onCreated }) {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState([]);
   const [selected, setSelected] = useState([]);
+  const [announcement, setAnnouncement] = useState(false);
 
   const search = async (q) => {
     setQuery(q);
@@ -289,22 +445,36 @@ function NewConversationModal({ user, onClose, onCreated }) {
   };
 
   const create = async () => {
-    const isDM = selected.length === 1 && !name.trim();
-    if (isDM) {
-      const existing = await conversations.findDM(selected[0].id);
-      if (existing) return onCreated(existing);
-      const c = await conversations.create({ name: null, type: 'dm', memberIds: [selected[0].id] });
-      return onCreated(c);
+    try {
+      const isDM = selected.length === 1 && !name.trim() && !announcement;
+      if (isDM) {
+        const existing = await conversations.findDM(selected[0].id);
+        if (existing) return onCreated(existing);
+        const c = await conversations.create({ name: null, type: 'dm', memberIds: [selected[0].id], is_announcement: false });
+        return onCreated(c);
+      }
+      const c = await conversations.create({
+        name: name.trim() || 'New group',
+        type: 'group',
+        memberIds: selected.map((s) => s.id),
+        is_announcement: announcement,
+      });
+      onCreated(c);
+    } catch (err) {
+      console.error('[Create]', err);
+      alert('Failed to create: ' + (err.message || JSON.stringify(err)));
     }
-    const c = await conversations.create({ name: name.trim() || 'New group', type: 'group', memberIds: selected.map((s) => s.id) });
-    onCreated(c);
   };
 
   return html`
     <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-50" onClick=${(e) => e.target === e.currentTarget && onClose()}>
       <div className="bg-white dark:bg-slate-900 rounded-xl max-w-md w-full p-4 flex flex-col gap-3">
         <h2 className="text-lg font-bold">New conversation</h2>
-        <input className="px-3 py-2 border rounded dark:bg-slate-800 dark:border-slate-700" placeholder="Group name (leave blank for DM)" value=${name} onChange=${(e) => setName(e.target.value)} />
+        <input className="px-3 py-2 border rounded dark:bg-slate-800 dark:border-slate-700" placeholder="Group name (blank for DM)" value=${name} onChange=${(e) => setName(e.target.value)} />
+        <label className="flex items-center gap-2 text-sm">
+          <input type="checkbox" checked=${announcement} onChange=${(e) => setAnnouncement(e.target.checked)} />
+          Announcement group (only creator can message)
+        </label>
         <input className="px-3 py-2 border rounded dark:bg-slate-800 dark:border-slate-700" placeholder="Search users…" value=${query} onChange=${(e) => search(e.target.value)} />
         <div className="max-h-48 overflow-y-auto flex flex-col gap-1">
           ${results.map((r) => html`
@@ -316,7 +486,7 @@ function NewConversationModal({ user, onClose, onCreated }) {
         </div>
         <div className="flex justify-end gap-2">
           <button onClick=${onClose} className="px-3 py-1 rounded hover:bg-slate-100 dark:hover:bg-slate-800">Cancel</button>
-          <button onClick=${create} className="px-3 py-1 rounded bg-indigo-600 text-white disabled:opacity-50" disabled=${selected.length === 0}>Create</button>
+          <button onClick=${create} className="px-3 py-1 rounded bg-indigo-600 text-white disabled:opacity-50" disabled=${selected.length === 0 && !name.trim()}>Create</button>
         </div>
       </div>
     </div>
